@@ -1,0 +1,199 @@
+---
+title: "Expected Goals Prediction (xG)"
+author: "Maha Salama"
+date: "11/17/2021"
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The term xG in football stands for 'expected goals'. It is a statistical measurement of the quality of goalscoring chances and the likelihood of them being scored.
+
+The goal of this task is to use shots and frames data to identify what could be the best predictors for goals, so that we have a new metric (xG) created, that calculates the probability of a shot being scored.
+
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(corrplot)
+library(sjmisc)
+library(plotly)
+library(reshape2)
+```
+
+### Data Loading:
+First, the 2 dataframes used for this task are loaded, shots_df (containing shot data), and frames_df (containing freeze frame data that represents players other than the shooter with their locations and positions at the time of each shot).
+
+```{r message=FALSE, warning=FALSE}
+shots.df <- read.csv("./shots_df.csv")
+frames.df <- read.csv("./shots_freeze_frames_df.csv")
+
+```
+
+### Data Exploration:
+Data is explored and some summary statistics applied.
+```{r message=FALSE, warning=FALSE}
+summary(shots.df)
+summary(frames.df)
+```
+
+### Data Cleaning:
+NAs removed, categorical variables adjusted, 
+Target variable added (is_goal): created from outcome.name variable.
+```{r message=FALSE, warning=FALSE}
+shots.df[is.na(shots.df)] <- FALSE
+
+shots.df$is_goal <- 0
+shots.df$is_goal[shots.df$shot.outcome.name == "Goal"] <- 1
+```
+
+### Feature Engineering:
+The 2 dataframes are joined, and the needed features for the analysis are created.
+
+##### Features to be used: 
+1. Shot distance: Distance between the shot location and the central point of the goal line (120,40). 
+2. Shot angle: calculated from shot location, dimensions of the field and length of the goal (7.32 meters)
+3. opponents in space: how many opponents in between the player and the goal
+4. defenders in space: how many of them are defenders
+5. goalkeeper position
+```{r message=FALSE, warning=FALSE}
+cleaned.data <- shots.df %>%
+  rename(x= location.x, y= location.y)%>%
+  mutate(shot.distance = sqrt((120 - x)^2 + (40 - y)^2),
+         shot.angle = atan(7.32*(120 - x)/((120 - x)^2+(40 - y)^2-(7.32/2)^2))* 180/pi) %>%
+  modify_if(is.character, as.factor) 
+
+# Join the 2 DFs at shot id, and extract features about opponents positions:
+## (number of opponents in between the player and the goal, number of defenders, position of goalkeeper).
+joined.df <- merge(cleaned.data, frames.df, by = "id") %>%
+  rename(other.x= location.x, other.y= location.y, other.position = position.name.y)%>%
+  mutate(other.distance = sqrt((120 - other.x)^2 + (40 - other.y)^2),
+         other.in.space = ifelse(other.distance < shot.distance, TRUE, FALSE),
+         opp.in.space = ifelse(other.in.space & !teammate, TRUE, FALSE),
+         defenders.in.space = ifelse(opp.in.space & grepl("Defensive", other.position), TRUE, FALSE))
+
+eng.df <- joined.df %>% 
+  group_by(id,player.name.x,team.name,
+           minute,second,possession,duration,under_pressure,
+           play_pattern.name, shot.body_part.name,
+           shot.technique.name, shot.type.name, match_id,
+           shot.open_goal, shot.first_time, shot.redirect, shot.deflected, shot.saved_to_post, 
+           shot.distance, shot.angle,shot.statsbomb_xg, is_goal) %>%
+  summarize(sum.opp.in.space = sum(opp.in.space),
+            sum.defenders.in.space = sum(defenders.in.space),
+            goal_keeper_distance = other.distance[other.position == "Goalkeeper"])
+```
+
+
+### Data Exploration Again:
+After feature engineering and joining the dataframes, data is explored again to discover relations and correlations between the variables are explored.
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+data.cor <- eng.df[,-grep("match.id",colnames(eng.df))]
+data.cor <- cor(data.cor[, unlist(lapply(data.cor, is.numeric))])
+```
+```{r cor, echo=FALSE, fig.cap="correlation matrix"}
+corrplot(data.cor)
+```
+
+### Data Modeling:
+Next, a model is created to make predictions of expected goals.
+First, the data is split into train and test.
+Then, logistic regression is applied to the data to generate probabilities of shots being scored.
+The features used to build this model are:
+shot.distance, shot.angle, sum.opp.in.space, sum.defenders.in.space, and goal_keeper_distance.
+```{r message=FALSE, warning=FALSE}
+# split the data into train & test
+data <- eng.df
+set.seed(101) 
+# Selecting 80% as train data  
+sample <- sample.int(n = nrow(data), size = floor(.8*nrow(data)), replace = F)
+train <- data[sample, ]
+test  <- data[-sample, ]
+
+# Build the model: logistic regression
+mod <- glm(is_goal ~ shot.distance  + shot.angle + sum.opp.in.space + sum.defenders.in.space + goal_keeper_distance, data=train, family=binomial)
+summary(mod)
+
+# getting the intercepts of the model
+int <- coef(mod)
+int_coef <- int[1]
+dist_coef <- int[2]
+ang_coef <- int[3]
+opp_coef <- int[4]
+def_coef <- int[5]
+gk_coef <- int[6]
+
+# giving the xG value to the shots
+for (i in seq(1,nrow(data))){
+  sum = int_coef + ang_coef*data[i,"shot.angle"] + (dist_coef*data[i,"shot.distance"])+ 
+    (opp_coef*data[i,"sum.opp.in.space"])+ (def_coef*data[i,"sum.defenders.in.space"])+ 
+    (gk_coef*data[i,"goal_keeper_distance"])
+  data[i,"xG"] = exp(sum)/(1+exp(sum))
+}
+data
+```
+
+### Plotting and Visualization:
+Next, some useful visualizations are created to plot the new metric (xG) against different variables and compare it to actual goals.
+
+##### 1. xG versus shot distance
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+# xG versus distance
+xg_distance <- data %>% ggplot(aes(data$shot.distance,data$xG)) + 
+  geom_point(color = "#20B2AA")+ ylim(c(0,1))+ geom_smooth(color = "orange")+
+  labs(title= "xG vs Distance",x ="Distance", y = "xG")
+
+```
+```{r distance, echo=FALSE}
+xg_distance
+```
+
+##### 2. xG vs statsBomb_xG
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+# xG vs statsBomb_xG
+xg_statsBomb <- data %>% ggplot(aes(data$xG,data$shot.statsbomb_xg)) + 
+  geom_point(color = "#20B2AA")+ geom_abline(color = "orange") +ylim(c(0,1))+
+  labs(title= "xG vs statsBomb_xG",x ="xG", y = "statsBomb xG")
+
+```
+```{r xG, echo=FALSE}
+xg_statsBomb
+```
+
+##### 3. Shots distribution across xG: 
+A plot visualizing shots spread versus xG to see where the majority of shots lie
+```{r echo = FALSE, message=FALSE, warning=FALSE}
+# shots distribution across xG
+shots.distribution <- data %>% ggplot(aes(data$xG)) + 
+  geom_histogram(color = "gray", fill = "#20B2AA")+
+  labs(title= "Shots Distribution Across Expected Goals",x ="xG", y = "Shots Frequency")
+```
+```{r distribution, echo=FALSE}
+ggplotly(shots.distribution)
+```
+
+##### 4. Compare actual goals and expected goals across different matches for "Manchester City WFC"
+Drawn at threshold = 0.3.
+```{r message=FALSE, warning=FALSE}
+# Compare actual goals and expected goals across different matches for "Manchester City WFC"
+# at threshold = 0.3
+actual.to.xG <- data %>% filter(team.name == "Manchester City WFC") %>%
+  group_by(match_id)%>%
+  mutate(xG.as.goals = ifelse(xG >= 0.3, 1, 0))%>%
+  summarise(actual.goals = sum(is_goal), expected.goals = sum(xG.as.goals)) %>%
+  melt(id = c("match_id"))%>%
+  ggplot(aes(match_id, value, color = variable)) + 
+  geom_smooth()+
+  labs(title= "Actual Goals vs. Expected Goals for Manchester City WFC",x ="Match ID", y = "Goals Count")
+```
+
+```{r actual, echo=FALSE}
+actual.to.xG
+```
+ 
